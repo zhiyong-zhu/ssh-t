@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use crate::app::{App, Dialog, Panel};
+use crate::app::{App, Dialog, Panel, SftpAction};
 
 /// Top-level draw function. Always uses tab-bar layout, no fullscreen mode.
 pub fn draw(f: &mut Frame, app: &App) {
@@ -202,11 +202,11 @@ fn draw_terminal(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_sftp(f: &mut Frame, app: &App, area: Rect) {
     let session = app.active_session();
-    if session.is_none() || session.unwrap().sftp_entries.is_empty() {
+    if session.is_none() {
         let empty_msg = vec![
             Line::from(""),
             Line::from(Span::styled(
-                " No files loaded",
+                " No active SFTP session",
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(Span::styled(
@@ -252,6 +252,7 @@ fn draw_sftp(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(icon),
                 Cell::from(entry.name.as_str()),
                 Cell::from(size),
+                Cell::from(entry.permissions.as_deref().unwrap_or("-")),
                 Cell::from(entry.modified.as_deref().unwrap_or("-")),
             ])
             .style(style)
@@ -264,6 +265,7 @@ fn draw_sftp(f: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(3),
             Constraint::Min(20),
             Constraint::Length(12),
+            Constraint::Length(8),
             Constraint::Length(20),
         ],
     )
@@ -272,6 +274,7 @@ fn draw_sftp(f: &mut Frame, app: &App, area: Rect) {
             Cell::from(""),
             Cell::from("Name"),
             Cell::from("Size"),
+            Cell::from("Perm"),
             Cell::from("Modified"),
         ])
         .style(Style::default().add_modifier(Modifier::BOLD))
@@ -279,13 +282,30 @@ fn draw_sftp(f: &mut Frame, app: &App, area: Rect) {
     )
     .block(
         Block::default()
-            .title(format!(" SFTP - {} ", session.sftp_remote_dir))
+            .title(sftp_title(session))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Magenta)),
     )
     .row_highlight_style(Style::default().bg(Color::Indexed(6)));
 
     f.render_stateful_widget(table, area, &mut session.sftp_state.clone());
+}
+
+fn sftp_title(session: &crate::app::Session) -> String {
+    if let Some(transfer) = &session.transfer_state {
+        let pct = if transfer.total > 0 {
+            transfer.transferred * 100 / transfer.total
+        } else {
+            0
+        };
+        let action = if transfer.is_upload { "upload" } else { "download" };
+        format!(
+            " SFTP - {} | {} {}% {} ",
+            session.sftp_remote_dir, action, pct, transfer.file
+        )
+    } else {
+        format!(" SFTP - {} ", session.sftp_remote_dir)
+    }
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
@@ -425,7 +445,15 @@ fn draw_input_bar(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled("r", Style::default().fg(Color::Green)),
                 Span::raw(":Refresh "),
                 Span::styled("d", Style::default().fg(Color::Green)),
-                Span::raw(":Download "),
+                Span::raw(":Down "),
+                Span::styled("u", Style::default().fg(Color::Green)),
+                Span::raw(":Up "),
+                Span::styled("m", Style::default().fg(Color::Green)),
+                Span::raw(":Mkdir "),
+                Span::styled("e", Style::default().fg(Color::Green)),
+                Span::raw(":Rename "),
+                Span::styled("x", Style::default().fg(Color::Red)),
+                Span::raw(":Del "),
                 Span::styled("Alt-H/T/S", Style::default().fg(Color::Green)),
                 Span::raw(":Panels "),
                 Span::styled("Alt-←/→", Style::default().fg(Color::Green)),
@@ -488,6 +516,14 @@ fn draw_dialog(f: &mut Frame, app: &App) {
             error,
         } => {
             draw_host_form_dialog(f, edit_index, name, host, port, user, auth, group, *field, error);
+        }
+        Dialog::SftpInput {
+            action,
+            prompt,
+            value,
+            error,
+        } => {
+            draw_sftp_input_dialog(f, action, prompt, value, error);
         }
     }
 }
@@ -661,6 +697,70 @@ fn draw_host_form_dialog(
                 .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
+                .style(Style::default().bg(Color::Black)),
+        )
+        .alignment(Alignment::Left);
+
+    f.render_widget(paragraph, area);
+}
+
+/// Draw SFTP operation input dialog.
+fn draw_sftp_input_dialog(
+    f: &mut Frame,
+    action: &SftpAction,
+    prompt: &str,
+    value: &str,
+    error: &Option<String>,
+) {
+    let area = centered_rect(70, 8, f.area());
+
+    let clear = Block::default().style(Style::default().bg(Color::Black));
+    f.render_widget(clear, area);
+
+    let title = match action {
+        SftpAction::Download { .. } => " Download ",
+        SftpAction::Upload { .. } => " Upload ",
+        SftpAction::Mkdir { .. } => " New Directory ",
+        SftpAction::Rename { .. } => " Rename ",
+        SftpAction::Delete { .. } => " Delete ",
+    };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" ", Style::default().fg(Color::DarkGray)),
+            Span::styled(prompt, Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(vec![
+            Span::styled(" > ", Style::default().fg(Color::Green)),
+            Span::raw(value.to_string()),
+            Span::raw("_"),
+        ]),
+    ];
+
+    if let Some(err) = error {
+        lines.push(Line::from(Span::styled(
+            format!(" {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Green)),
+        Span::raw(" confirm  "),
+        Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Red)),
+        Span::raw(" cancel"),
+    ]));
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(title)
+                .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
                 .style(Style::default().bg(Color::Black)),
         )
         .alignment(Alignment::Left);

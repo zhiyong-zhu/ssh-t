@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 
 /// Messages from async SFTP operations.
 #[derive(Debug)]
-enum SftpOp {
+pub(crate) enum SftpOp {
     Listed { path: String, entries: Vec<FileEntry> },
     Changed { message: String, refresh_path: String },
     Error(String),
@@ -84,6 +84,7 @@ pub struct Session {
     pub id: usize,
     pub name: String,
     pub host_config: HostConfig,
+    pub auth_password: Option<String>,
     pub manager: Option<SshManager>,
     pub term_screen: TermScreen,
     pub manager_rx: Option<oneshot::Receiver<SshManager>>,
@@ -103,6 +104,7 @@ impl Session {
             id,
             name: host_config.name.clone(),
             host_config,
+            auth_password: None,
             manager: None,
             term_screen: TermScreen::new(5000),
             manager_rx: None,
@@ -320,6 +322,7 @@ impl App {
                         let session_id = self.next_session_id;
                         self.next_session_id += 1;
                         let mut session = Session::new(session_id, host.clone());
+                        session.auth_password = Some(pwd.clone());
 
                         let (sftp_tx, sftp_rx) = mpsc::unbounded_channel();
                         session.sftp_tx = Some(sftp_tx);
@@ -797,7 +800,11 @@ impl App {
                         SftpOp::Listed { path, entries } => {
                             session.sftp_remote_dir = path;
                             session.sftp_entries = entries;
-                            session.sftp_state.select(None);
+                            if session.sftp_entries.is_empty() {
+                                session.sftp_state.select(None);
+                            } else {
+                                session.sftp_state.select(Some(0));
+                            }
                             self.status_msg = format!("Loaded: {}", session.sftp_remote_dir);
                         }
                         SftpOp::Changed { message, refresh_path } => {
@@ -1102,11 +1109,18 @@ impl App {
         let host_name = host.name.clone();
         self.dialog = Dialog::Connecting { host_name: host_name.clone() };
         self.status_msg = format!("Connecting to {}...", host.name);
+        let auth_password = match &host.auth {
+            AuthMethod::Password => {
+                crate::cred::CredentialStore::get_password(&host.host, &host.user).ok()
+            }
+            _ => None,
+        };
 
         // Create new session
         let session_id = self.next_session_id;
         self.next_session_id += 1;
         let mut session = Session::new(session_id, host.clone());
+        session.auth_password = auth_password.clone();
 
         let (sftp_tx, sftp_rx) = mpsc::unbounded_channel();
         session.sftp_tx = Some(sftp_tx);
@@ -1123,7 +1137,12 @@ impl App {
         let rows = self.terminal_rows;
 
         tokio::spawn(async move {
-            let mut manager = SshManager::new(session_id, host, event_tx.clone());
+            let mut manager = Self::ssh_manager_with_optional_password(
+                session_id,
+                host,
+                event_tx.clone(),
+                auth_password,
+            );
 
             if let Err(e) = manager.connect().await {
                 event_tx.send(SshEvent::Error { id: session_id, message: e.to_string() }).ok();
@@ -1143,6 +1162,19 @@ impl App {
 
             event_tx.send(SshEvent::Connected { id: session_id, name: host_name }).ok();
         });
+    }
+
+    fn ssh_manager_with_optional_password(
+        session_id: usize,
+        host_config: HostConfig,
+        event_tx: mpsc::UnboundedSender<SshEvent>,
+        auth_password: Option<String>,
+    ) -> SshManager {
+        if let Some(password) = auth_password {
+            SshManager::with_password(session_id, host_config, event_tx, password)
+        } else {
+            SshManager::new(session_id, host_config, event_tx)
+        }
     }
 
     fn handle_terminal_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -1415,34 +1447,148 @@ impl App {
         self.list_sftp_dir(path);
     }
 
-    fn download_file(&mut self, name: &str, remote_path: &str) {
-        let local_dir = dirs::home_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| ".".to_string());
-        let local_path = format!("{}/{}", local_dir, name);
+    fn run_sftp_input_action(&mut self, action: SftpAction, value: String) {
+        let value = value.trim().to_string();
+        match action.clone() {
+            SftpAction::Download { remote_path } => {
+                if value.is_empty() {
+                    self.dialog = Dialog::SftpInput {
+                        action,
+                        prompt: "Download to local path".to_string(),
+                        value,
+                        error: Some("Local path cannot be empty".to_string()),
+                    };
+                    return;
+                }
+                self.download_file(remote_path, value);
+            }
+            SftpAction::Upload { remote_dir } => {
+                if value.is_empty() {
+                    self.dialog = Dialog::SftpInput {
+                        action,
+                        prompt: "Upload local file path".to_string(),
+                        value,
+                        error: Some("Local path cannot be empty".to_string()),
+                    };
+                    return;
+                }
+                self.upload_file(value, remote_dir);
+            }
+            SftpAction::Mkdir { parent } => {
+                if value.is_empty() || value.contains('/') {
+                    self.dialog = Dialog::SftpInput {
+                        action,
+                        prompt: "New remote directory name".to_string(),
+                        value,
+                        error: Some("Enter a directory name, not a path".to_string()),
+                    };
+                    return;
+                }
+                let remote_path = Self::join_remote_path(&parent, &value);
+                self.run_sftp_change(
+                    parent,
+                    format!("Creating directory: {remote_path}"),
+                    move |engine| Box::pin(async move { engine.mkdir(&remote_path).await }),
+                    "Directory created".to_string(),
+                );
+            }
+            SftpAction::Rename { old_path } => {
+                if value.is_empty() || value.contains('/') {
+                    self.dialog = Dialog::SftpInput {
+                        action,
+                        prompt: "Rename remote item to".to_string(),
+                        value,
+                        error: Some("Enter a new name, not a path".to_string()),
+                    };
+                    return;
+                }
+                let parent = Self::remote_parent(&old_path);
+                let new_path = Self::join_remote_path(&parent, &value);
+                self.run_sftp_change(
+                    parent,
+                    format!("Renaming to: {new_path}"),
+                    move |engine| Box::pin(async move { engine.rename(&old_path, &new_path).await }),
+                    "Rename completed".to_string(),
+                );
+            }
+            SftpAction::Delete { path, is_dir } => {
+                if value != "yes" {
+                    self.dialog = Dialog::SftpInput {
+                        action,
+                        prompt: "Type yes to delete selected item".to_string(),
+                        value,
+                        error: Some("Deletion requires typing yes".to_string()),
+                    };
+                    return;
+                }
+                let parent = Self::remote_parent(&path);
+                self.run_sftp_change(
+                    parent,
+                    format!("Deleting: {path}"),
+                    move |engine| {
+                        Box::pin(async move {
+                            if is_dir {
+                                engine.remove_dir(&path).await
+                            } else {
+                                engine.remove_file(&path).await
+                            }
+                        })
+                    },
+                    "Delete completed".to_string(),
+                );
+            }
+        }
+    }
+
+    fn default_download_path(name: &str) -> String {
+        let dir = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        dir.join(name).to_string_lossy().to_string()
+    }
+
+    fn join_remote_path(parent: &str, name: &str) -> String {
+        if parent == "/" {
+            format!("/{}", name.trim_start_matches('/'))
+        } else {
+            format!("{}/{}", parent.trim_end_matches('/'), name.trim_start_matches('/'))
+        }
+    }
+
+    fn remote_parent(path: &str) -> String {
+        let path = path.trim_end_matches('/');
+        match path.rfind('/') {
+            Some(0) | None => "/".to_string(),
+            Some(idx) => path[..idx].to_string(),
+        }
+    }
+
+    fn download_file(&mut self, remote_path: String, local_path: String) {
         self.status_msg = format!("Downloading {} to: {}", remote_path, local_path);
 
-        // Get host config for SFTP connection
-        let host_config = match self.sessions.get(self.active_session).map(|s| s.host_config.clone()) {
-            Some(h) => h,
+        let (host_config, auth_password) = match self.sessions.get(self.active_session) {
+            Some(session) => (session.host_config.clone(), session.auth_password.clone()),
             None => {
                 self.status_msg = "Not connected to SSH".to_string();
                 return;
             }
         };
 
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let remote = remote_path.to_string();
-        let local = local_path.clone();
+        let (tx, rx) = mpsc::unbounded_channel();
+        if let Some(session) = self.sessions.get_mut(self.active_session) {
+            session.sftp_rx = Some(rx);
+        }
+        let remote = remote_path;
+        let local = local_path;
 
         tokio::spawn(async move {
-            // Create a new SSH connection for SFTP
-            let event_tx = mpsc::unbounded_channel().0; // Dummy event tx for the manager
-            let mut manager = SshManager::new(0, host_config, event_tx);
+            let event_tx = mpsc::unbounded_channel().0;
+            let mut manager =
+                Self::ssh_manager_with_optional_password(0, host_config, event_tx, auth_password);
 
             if let Err(e) = manager.connect().await {
                 let _ = tx.send(TransferEvent::Error {
-                    file: remote,
+                    file: remote.clone(),
                     error: format!("SSH connect failed: {e}"),
                 });
                 return;
@@ -1453,23 +1599,143 @@ impl App {
                     let mut engine = SftpEngine::new(tx.clone());
                     if let Err(e) = engine.init(stream).await {
                         let _ = tx.send(TransferEvent::Error {
-                            file: remote,
+                            file: remote.clone(),
                             error: format!("SFTP init failed: {e}"),
                         });
                         return;
                     }
                     if let Err(e) = engine.download(&remote, &local).await {
                         let _ = tx.send(TransferEvent::Error {
-                            file: remote,
+                            file: remote.clone(),
                             error: e.to_string(),
                         });
                     }
                 }
                 Err(e) => {
                     let _ = tx.send(TransferEvent::Error {
-                        file: remote,
+                        file: remote.clone(),
                         error: format!("Failed to open SFTP: {e}"),
                     });
+                }
+            }
+        });
+    }
+
+    fn upload_file(&mut self, local_path: String, remote_dir: String) {
+        let local_file_name = match std::path::Path::new(&local_path).file_name() {
+            Some(name) => name.to_string_lossy().to_string(),
+            None => {
+                self.status_msg = "Upload failed: invalid local path".to_string();
+                return;
+            }
+        };
+        let remote_path = Self::join_remote_path(&remote_dir, &local_file_name);
+        self.status_msg = format!("Uploading {} to: {}", local_path, remote_path);
+
+        let (host_config, auth_password) = match self.sessions.get(self.active_session) {
+            Some(session) => (session.host_config.clone(), session.auth_password.clone()),
+            None => {
+                self.status_msg = "Not connected to SSH".to_string();
+                return;
+            }
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        if let Some(session) = self.sessions.get_mut(self.active_session) {
+            session.sftp_rx = Some(rx);
+        }
+        let local = local_path;
+        let remote = remote_path;
+
+        tokio::spawn(async move {
+            let event_tx = mpsc::unbounded_channel().0;
+            let mut manager =
+                Self::ssh_manager_with_optional_password(0, host_config, event_tx, auth_password);
+
+            if let Err(e) = manager.connect().await {
+                let _ = tx.send(TransferEvent::Error {
+                    file: local.clone(),
+                    error: format!("SSH connect failed: {e}"),
+                });
+                return;
+            }
+
+            match manager.open_sftp_stream().await {
+                Ok(stream) => {
+                    let mut engine = SftpEngine::new(tx.clone());
+                    if let Err(e) = engine.init(stream).await {
+                        let _ = tx.send(TransferEvent::Error {
+                            file: local.clone(),
+                            error: format!("SFTP init failed: {e}"),
+                        });
+                        return;
+                    }
+                    if let Err(e) = engine.upload(&local, &remote).await {
+                        let _ = tx.send(TransferEvent::Error {
+                            file: local.clone(),
+                            error: e.to_string(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(TransferEvent::Error {
+                        file: local.clone(),
+                        error: format!("Failed to open SFTP: {e}"),
+                    });
+                }
+            }
+        });
+    }
+
+    fn run_sftp_change<F>(&mut self, refresh_path: String, status: String, op: F, success: String)
+    where
+        F: FnOnce(SftpEngine) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+            + Send
+            + 'static,
+    {
+        self.status_msg = status;
+
+        let (host_config, auth_password) = match self.sessions.get(self.active_session) {
+            Some(session) => (session.host_config.clone(), session.auth_password.clone()),
+            None => {
+                self.status_msg = "Not connected to SSH".to_string();
+                return;
+            }
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        if let Some(session) = self.sessions.get_mut(self.active_session) {
+            session.sftp_op_rx = Some(rx);
+        }
+
+        tokio::spawn(async move {
+            let event_tx = mpsc::unbounded_channel().0;
+            let mut manager =
+                Self::ssh_manager_with_optional_password(0, host_config, event_tx, auth_password);
+
+            if let Err(e) = manager.connect().await {
+                let _ = tx.send(SftpOp::Error(format!("SSH connect failed: {e}")));
+                return;
+            }
+
+            match manager.open_sftp_stream().await {
+                Ok(stream) => {
+                    let mut engine = SftpEngine::new(mpsc::unbounded_channel().0);
+                    if let Err(e) = engine.init(stream).await {
+                        let _ = tx.send(SftpOp::Error(format!("SFTP init failed: {e}")));
+                        return;
+                    }
+                    if let Err(e) = op(engine).await {
+                        let _ = tx.send(SftpOp::Error(e.to_string()));
+                    } else {
+                        let _ = tx.send(SftpOp::Changed {
+                            message: success,
+                            refresh_path,
+                        });
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(SftpOp::Error(format!("Failed to open SFTP: {e}")));
                 }
             }
         });
@@ -1502,8 +1768,8 @@ impl App {
 
     fn list_sftp_dir(&mut self, path: String) {
         // Get host config for SFTP connection
-        let host_config = match self.sessions.get(self.active_session).map(|s| s.host_config.clone()) {
-            Some(h) => h,
+        let (host_config, auth_password) = match self.sessions.get(self.active_session) {
+            Some(session) => (session.host_config.clone(), session.auth_password.clone()),
             None => {
                 self.status_msg = "Not connected to SSH".to_string();
                 return;
@@ -1521,7 +1787,8 @@ impl App {
         tokio::spawn(async move {
             // Create a new SSH connection for SFTP
             let event_tx = mpsc::unbounded_channel().0; // Dummy event tx
-            let mut manager = SshManager::new(0, host_config, event_tx);
+            let mut manager =
+                Self::ssh_manager_with_optional_password(0, host_config, event_tx, auth_password);
 
             if let Err(e) = manager.connect().await {
                 let _ = tx.send(SftpOp::Error(format!("SSH connect failed: {e}")));
