@@ -12,7 +12,18 @@ use tokio::sync::{mpsc, oneshot};
 #[derive(Debug)]
 enum SftpOp {
     Listed { path: String, entries: Vec<FileEntry> },
+    Changed { message: String, refresh_path: String },
     Error(String),
+}
+
+/// SFTP text input operation.
+#[derive(Debug, Clone)]
+pub enum SftpAction {
+    Download { remote_path: String },
+    Upload { remote_dir: String },
+    Mkdir { parent: String },
+    Rename { old_path: String },
+    Delete { path: String, is_dir: bool },
 }
 
 /// Current active panel in the TUI.
@@ -22,6 +33,19 @@ pub enum Panel {
     Terminal,
     Sftp,
     Help,
+}
+
+/// Tab click action for tab bar interaction.
+#[derive(Debug, Clone)]
+pub enum TabAction {
+    Session(usize),
+    Panel(Panel),
+}
+
+/// Tab layout info for click detection.
+pub struct TabLayout {
+    /// (start_col, width, action) for each clickable tab
+    pub tabs: Vec<(u16, u16, TabAction)>,
 }
 
 /// Dialog state for interactive inputs.
@@ -45,6 +69,12 @@ pub enum Dialog {
         auth: AuthMethod,
         group: String,
         field: usize,
+        error: Option<String>,
+    },
+    SftpInput {
+        action: SftpAction,
+        prompt: String,
+        value: String,
         error: Option<String>,
     },
 }
@@ -204,6 +234,61 @@ impl App {
             Panel::Sftp => self.handle_sftp_key(key),
             Panel::Help => self.handle_help_key(key),
         }
+    }
+
+    /// Handle application-level tab and panel navigation before panel-specific keys.
+    pub fn handle_global_key(&mut self, key: KeyEvent) -> Result<bool> {
+        use crossterm::event::KeyCode;
+
+        if self.has_dialog() {
+            return Ok(false);
+        }
+
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char(c) => {
+                    match c.to_ascii_lowercase() {
+                        'h' => self.switch_panel(Panel::HostList),
+                        't' => self.switch_panel(Panel::Terminal),
+                        's' => self.switch_panel(Panel::Sftp),
+                        'n' | ']' => self.next_session(),
+                        'p' | '[' => self.prev_session(),
+                        'w' => self.close_active_session(),
+                        _ => return Ok(false),
+                    }
+                    return Ok(true);
+                }
+                KeyCode::Left => {
+                    self.prev_session();
+                    return Ok(true);
+                }
+                KeyCode::Right => {
+                    self.next_session();
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+
+        if key.modifiers == KeyModifiers::NONE {
+            match key.code {
+                KeyCode::F(1) => {
+                    self.switch_panel(Panel::HostList);
+                    return Ok(true);
+                }
+                KeyCode::F(2) => {
+                    self.switch_panel(Panel::Terminal);
+                    return Ok(true);
+                }
+                KeyCode::F(3) => {
+                    self.switch_panel(Panel::Sftp);
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(false)
     }
 
     fn handle_dialog_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -441,6 +526,49 @@ impl App {
                     }
                 }
             }
+            Dialog::SftpInput {
+                action,
+                prompt,
+                value,
+                error,
+            } => match key.code {
+                KeyCode::Esc => {
+                    self.dialog = Dialog::None;
+                    self.status_msg = "SFTP operation canceled".to_string();
+                }
+                KeyCode::Enter => {
+                    self.dialog = Dialog::None;
+                    self.run_sftp_input_action(action, value);
+                }
+                KeyCode::Backspace => {
+                    let mut next = value;
+                    next.pop();
+                    self.dialog = Dialog::SftpInput {
+                        action,
+                        prompt,
+                        value: next,
+                        error,
+                    };
+                }
+                KeyCode::Char(c) if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT => {
+                    let mut next = value;
+                    next.push(c);
+                    self.dialog = Dialog::SftpInput {
+                        action,
+                        prompt,
+                        value: next,
+                        error: None,
+                    };
+                }
+                _ => {
+                    self.dialog = Dialog::SftpInput {
+                        action,
+                        prompt,
+                        value,
+                        error,
+                    };
+                }
+            },
             Dialog::None => {}
         }
         Ok(())
@@ -456,7 +584,17 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let row = mouse.row as usize;
+                let row = mouse.row;
+                let col = mouse.column;
+
+                // Row 0 = tab bar — handle tab clicks
+                if row == 0 {
+                    self.handle_tab_click(col);
+                    return Ok(());
+                }
+
+                // Other rows — handle list/table clicks
+                let row = row as usize;
                 match self.panel {
                     Panel::HostList => {
                         let filtered = self.filtered_hosts();
@@ -518,6 +656,63 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Handle a click on the tab bar.
+    fn handle_tab_click(&mut self, col: u16) {
+        let layout = self.compute_tab_layout();
+        for (start, width, action) in &layout.tabs {
+            if col >= *start && col < *start + *width {
+                match action.clone() {
+                    TabAction::Session(idx) => {
+                        self.activate_session(idx);
+                    }
+                    TabAction::Panel(panel) => {
+                        self.switch_panel(panel);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    /// Compute tab layout for click detection. Must match the TUI tab bar rendering.
+    fn compute_tab_layout(&self) -> TabLayout {
+        let mut tabs = Vec::new();
+        let mut col: u16 = 0;
+
+        // " ssh-t "
+        col += 7;
+        // "│"
+        col += 1;
+
+        // Session tabs
+        if !self.sessions.is_empty() {
+            for (i, session) in self.sessions.iter().enumerate() {
+                let connected = session.manager.is_some();
+                let marker = if connected { "●" } else { "○" };
+                let label = format!(" {} {} ", marker, session.name);
+                let width = label.len() as u16;
+                tabs.push((col, width, TabAction::Session(i)));
+                col += width;
+            }
+            // "│"
+            col += 1;
+        }
+
+        // Panel tabs
+        let panel_tabs: &[(&str, Panel)] = &[
+            (" Alt-H Hosts ", Panel::HostList),
+            (" Alt-T Term ", Panel::Terminal),
+            (" Alt-S SFTP ", Panel::Sftp),
+        ];
+        for (label, panel) in panel_tabs {
+            let width = label.len() as u16;
+            tabs.push((col, width, TabAction::Panel(*panel)));
+            col += width;
+        }
+
+        TabLayout { tabs }
     }
 
     /// Poll and process SSH events.
@@ -594,6 +789,7 @@ impl App {
         }
 
         // Poll SFTP operation results for active session
+        let mut pending_sftp_refresh: Option<String> = None;
         if let Some(session) = self.sessions.get_mut(self.active_session) {
             if let Some(rx) = &mut session.sftp_op_rx {
                 while let Ok(op) = rx.try_recv() {
@@ -603,6 +799,10 @@ impl App {
                             session.sftp_entries = entries;
                             session.sftp_state.select(None);
                             self.status_msg = format!("Loaded: {}", session.sftp_remote_dir);
+                        }
+                        SftpOp::Changed { message, refresh_path } => {
+                            self.status_msg = message;
+                            pending_sftp_refresh = Some(refresh_path);
                         }
                         SftpOp::Error(e) => {
                             self.status_msg = format!("SFTP Error: {e}");
@@ -633,8 +833,16 @@ impl App {
                             self.status_msg = format!("Transfer: {}% - {}", pct, file);
                         }
                         TransferEvent::Completed { file } => {
+                            let refresh_after_upload = session
+                                .transfer_state
+                                .as_ref()
+                                .map(|state| state.is_upload)
+                                .unwrap_or(false);
                             session.transfer_state = None;
                             self.status_msg = format!("Completed: {}", file);
+                            if refresh_after_upload {
+                                pending_sftp_refresh = Some(session.sftp_remote_dir.clone());
+                            }
                         }
                         TransferEvent::Error { file, error } => {
                             session.transfer_state = None;
@@ -643,6 +851,9 @@ impl App {
                     }
                 }
             }
+        }
+        if let Some(path) = pending_sftp_refresh {
+            self.list_sftp_dir(path);
         }
     }
 
@@ -663,34 +874,54 @@ impl App {
         }
     }
 
+    /// Activate a session tab and show its terminal.
+    fn activate_session(&mut self, index: usize) {
+        if index >= self.sessions.len() {
+            return;
+        }
+
+        self.active_session = index;
+        self.panel = Panel::Terminal;
+        self.status_msg = format!("Switched to: {}", self.sessions[index].name);
+        if let Some(ref mgr) = self.sessions[index].manager {
+            let _ = mgr.resize(self.terminal_cols, self.terminal_rows);
+        }
+    }
+
+    /// Close the current session tab.
+    pub fn close_active_session(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+
+        let pos = self.active_session;
+        let name = self.sessions[pos].name.clone();
+        if let Some(mut mgr) = self.sessions[pos].manager.take() {
+            tokio::spawn(async move {
+                let _ = mgr.disconnect().await;
+            });
+        }
+        self.remove_session(pos);
+        self.status_msg = format!("Closed: {name}");
+    }
+
     /// Switch to the next session.
     pub fn next_session(&mut self) {
         if self.sessions.len() > 1 {
-            self.active_session = (self.active_session + 1) % self.sessions.len();
-            self.status_msg = format!("Switched to: {}", self.sessions[self.active_session].name);
-            // Resize the new active session
-            if let Some(session) = self.sessions.get(self.active_session) {
-                if let Some(ref mgr) = session.manager {
-                    let _ = mgr.resize(self.terminal_cols, self.terminal_rows);
-                }
-            }
+            let next = (self.active_session + 1) % self.sessions.len();
+            self.activate_session(next);
         }
     }
 
     /// Switch to the previous session.
     pub fn prev_session(&mut self) {
         if self.sessions.len() > 1 {
-            if self.active_session == 0 {
-                self.active_session = self.sessions.len() - 1;
+            let prev = if self.active_session == 0 {
+                self.sessions.len() - 1
             } else {
-                self.active_session -= 1;
-            }
-            self.status_msg = format!("Switched to: {}", self.sessions[self.active_session].name);
-            if let Some(session) = self.sessions.get(self.active_session) {
-                if let Some(ref mgr) = session.manager {
-                    let _ = mgr.resize(self.terminal_cols, self.terminal_rows);
-                }
-            }
+                self.active_session - 1
+            };
+            self.activate_session(prev);
         }
     }
 
@@ -735,13 +966,13 @@ impl App {
         let filtered = self.filtered_hosts();
 
         match key.code {
-            KeyCode::Char('q') => {
+            KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => {
                 self.running = false;
             }
-            KeyCode::Char('?') => {
+            KeyCode::Char('?') if key.modifiers == KeyModifiers::NONE => {
                 self.panel = Panel::Help;
             }
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') if key.modifiers == KeyModifiers::NONE => {
                 // Add new host
                 let current_user = std::env::var("USER")
                     .or_else(|_| std::env::var("USERNAME"))
@@ -758,7 +989,7 @@ impl App {
                     error: None,
                 };
             }
-            KeyCode::Char('e') => {
+            KeyCode::Char('e') if key.modifiers == KeyModifiers::NONE => {
                 // Edit selected host
                 if let Some(i) = self.host_list_state.selected() {
                     if let Some(host) = self.config.hosts.get(i) {
@@ -776,7 +1007,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('d') => {
+            KeyCode::Char('d') if key.modifiers == KeyModifiers::NONE => {
                 // Delete selected host
                 if let Some(i) = self.host_list_state.selected() {
                     if i < self.config.hosts.len() {
@@ -819,7 +1050,13 @@ impl App {
             KeyCode::Backspace => {
                 self.host_filter.pop();
             }
-            KeyCode::Char(c) => {
+            KeyCode::Tab => {
+                // Switch to terminal (active session)
+                if !self.sessions.is_empty() {
+                    self.panel = Panel::Terminal;
+                }
+            }
+            KeyCode::Char(c) if key.modifiers == KeyModifiers::NONE => {
                 if c != 'q' && c != '?' && c != 'a' && c != 'e' && c != 'd' {
                     self.host_filter.push(c);
                 }
@@ -912,28 +1149,10 @@ impl App {
         use crossterm::event::KeyCode;
 
         match key.code {
-            KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => {
-                // Disconnect current session and return to host list
-                if let Some(session) = self.sessions.get_mut(self.active_session) {
-                    if let Some(mut mgr) = session.manager.take() {
-                        tokio::spawn(async move {
-                            let _ = mgr.disconnect().await;
-                        });
-                    }
-                }
-                self.remove_session(self.active_session);
-            }
-            KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
-                // Switch to next session
-                self.next_session();
-            }
-            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
-                // Switch to previous session
-                self.prev_session();
-            }
             KeyCode::Esc => {
-                // Return to host list without disconnecting
-                self.panel = Panel::HostList;
+                if let Some(session) = self.active_session() {
+                    if let Some(ref mgr) = session.manager { mgr.send_input(b"\x1b")?; }
+                }
             }
             KeyCode::Enter => {
                 if let Some(session) = self.active_session() {
@@ -995,10 +1214,20 @@ impl App {
                     if let Some(ref mgr) = session.manager { mgr.send_input(b"\t")?; }
                 }
             }
+            KeyCode::BackTab => {
+                if let Some(session) = self.active_session() {
+                    if let Some(ref mgr) = session.manager { mgr.send_input(b"\x1b[Z")?; }
+                }
+            }
             KeyCode::Char(c) => {
                 if let Some(session) = self.active_session() {
                     if let Some(ref mgr) = session.manager {
-                        if key.modifiers == KeyModifiers::CONTROL {
+                        if key.modifiers.contains(KeyModifiers::ALT) {
+                            let mut data = vec![0x1b];
+                            let mut buf = [0u8; 4];
+                            data.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                            mgr.send_input(&data)?;
+                        } else if key.modifiers == KeyModifiers::CONTROL {
                             mgr.send_input(&[(c as u8) & 0x1F])?;
                         } else {
                             let mut buf = [0u8; 4];
@@ -1076,19 +1305,67 @@ impl App {
                 self.refresh_sftp();
             }
             KeyCode::Char('d') => {
-                // Download selected file
                 let entry = self.sessions.get(self.active_session)
                     .and_then(|s| s.sftp_state.selected())
                     .and_then(|i| self.sessions.get(self.active_session)?.sftp_entries.get(i).cloned());
                 if let Some(entry) = entry {
                     if !entry.is_dir {
-                        self.download_file(&entry.name, &entry.path);
+                        self.dialog = Dialog::SftpInput {
+                            action: SftpAction::Download { remote_path: entry.path.clone() },
+                            prompt: "Download to local path".to_string(),
+                            value: Self::default_download_path(&entry.name),
+                            error: None,
+                        };
                     }
                 }
             }
             KeyCode::Char('u') => {
-                // Upload - show file dialog (placeholder)
-                self.status_msg = "Upload: Enter local file path".to_string();
+                let remote_dir = self.sessions.get(self.active_session)
+                    .map(|s| s.sftp_remote_dir.clone())
+                    .unwrap_or_else(|| "/".to_string());
+                self.dialog = Dialog::SftpInput {
+                    action: SftpAction::Upload { remote_dir },
+                    prompt: "Upload local file path".to_string(),
+                    value: String::new(),
+                    error: None,
+                };
+            }
+            KeyCode::Char('m') => {
+                let parent = self.sessions.get(self.active_session)
+                    .map(|s| s.sftp_remote_dir.clone())
+                    .unwrap_or_else(|| "/".to_string());
+                self.dialog = Dialog::SftpInput {
+                    action: SftpAction::Mkdir { parent },
+                    prompt: "New remote directory name".to_string(),
+                    value: String::new(),
+                    error: None,
+                };
+            }
+            KeyCode::Char('e') => {
+                let entry = self.sessions.get(self.active_session)
+                    .and_then(|s| s.sftp_state.selected())
+                    .and_then(|i| self.sessions.get(self.active_session)?.sftp_entries.get(i).cloned());
+                if let Some(entry) = entry {
+                    self.dialog = Dialog::SftpInput {
+                        action: SftpAction::Rename { old_path: entry.path.clone() },
+                        prompt: "Rename remote item to".to_string(),
+                        value: entry.name,
+                        error: None,
+                    };
+                }
+            }
+            KeyCode::Char('x') => {
+                let entry = self.sessions.get(self.active_session)
+                    .and_then(|s| s.sftp_state.selected())
+                    .and_then(|i| self.sessions.get(self.active_session)?.sftp_entries.get(i).cloned());
+                if let Some(entry) = entry {
+                    self.dialog = Dialog::SftpInput {
+                        action: SftpAction::Delete { path: entry.path, is_dir: entry.is_dir },
+                        prompt: "Type yes to delete selected item".to_string(),
+                        value: String::new(),
+                        error: None,
+                    };
+                }
             }
             _ => {}
         }
@@ -1278,5 +1555,74 @@ impl App {
 impl Default for Dialog {
     fn default() -> Self {
         Dialog::None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn host(name: &str) -> HostConfig {
+        HostConfig {
+            name: name.to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 22,
+            user: "user".to_string(),
+            auth: AuthMethod::Password,
+            group: String::new(),
+            tags: vec![],
+            jump_host: None,
+            notes: String::new(),
+        }
+    }
+
+    fn app() -> App {
+        App::new(AppConfig {
+            hosts: vec![host("one")],
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn alt_letters_switch_panels() {
+        let mut app = app();
+
+        assert!(app.handle_global_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT)).unwrap());
+        assert_eq!(app.panel, Panel::Terminal);
+
+        assert!(app.handle_global_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT)).unwrap());
+        assert_eq!(app.panel, Panel::HostList);
+    }
+
+    #[test]
+    fn function_keys_switch_panels() {
+        let mut app = app();
+
+        assert!(app.handle_global_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)).unwrap());
+        assert_eq!(app.panel, Panel::Terminal);
+    }
+
+    #[test]
+    fn plain_digits_are_not_global_inside_terminal() {
+        let mut app = app();
+        assert!(!app.handle_global_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)).unwrap());
+
+        app.panel = Panel::Terminal;
+
+        assert!(!app.handle_global_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)).unwrap());
+        assert_eq!(app.panel, Panel::Terminal);
+    }
+
+    #[test]
+    fn alt_arrows_switch_session_tabs() {
+        let mut app = app();
+        app.sessions.push(Session::new(1, host("one")));
+        app.sessions.push(Session::new(2, host("two")));
+        app.active_session = 0;
+
+        assert!(app.handle_global_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)).unwrap());
+        assert_eq!(app.active_session, 1);
+        assert_eq!(app.panel, Panel::Terminal);
     }
 }

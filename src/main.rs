@@ -9,7 +9,7 @@ mod tui;
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -66,7 +66,7 @@ fn run_app(
     app.update_terminal_size(area.width, area.height);
 
     loop {
-        // Draw
+        // Draw (tab layout is stored in app by the draw function)
         terminal.draw(|f| tui::draw(f, app))?;
 
         // Poll events with timeout for async task polling
@@ -78,23 +78,8 @@ fn run_app(
                         continue;
                     }
 
-                    // Global panel switching (only when no dialog and not in terminal PTY mode)
-                    if app.panel != app::Panel::Terminal && !app.has_dialog() {
-                        match key.code {
-                            KeyCode::Char('1') => {
-                                app.switch_panel(app::Panel::HostList);
-                                continue;
-                            }
-                            KeyCode::Char('2') => {
-                                app.switch_panel(app::Panel::Terminal);
-                                continue;
-                            }
-                            KeyCode::Char('3') => {
-                                app.switch_panel(app::Panel::Sftp);
-                                continue;
-                            }
-                            _ => {}
-                        }
+                    if app.handle_global_key(key)? {
+                        continue;
                     }
 
                     app.handle_key(key)?;
